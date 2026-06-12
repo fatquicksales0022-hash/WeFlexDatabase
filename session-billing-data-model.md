@@ -1,91 +1,133 @@
-# Database Design — Recurring Sessions to Xero
+# Recurring sessions: data model, write path & migration
 
-How I'd build this on Postgres / Supabase — the schema, how a cancel-and-rematch keeps the delivery history, how I'd stop the portal, n8n and the Xero sync from stepping on each other, and how I'd roll it out with no downtime.
+How I'd build this on **Postgres / Supabase**. Four parts, matching the brief:
 
-Before the schema, the two calls everything else falls out of:
+1. The core tables, keys, and how a **cancel-and-rematch** keeps the full history of who delivered what.
+2. How the data stays **consistent** when the portal, n8n and the Xero sync all write the same session at once, and how a **retried automation** doesn't double-process.
+3. How delivered sessions become **Xero invoices** (batched, idempotent, safe to correct).
+4. How I'd **migrate** an existing system onto this with **zero downtime**.
 
-- I don't store **the current provider** on the session. The second you do that, a rematch overwrites it and you've lost who delivered. So delivery gets its own table.
-- I don't trust the portal, n8n and the Xero sync to each be careful on their own. Three independent writers will race eventually, so I'd rather push the real guarantees down into Postgres than coordinate them in app code.
+> Runnable schema lives in [`schema.sql`](schema.sql); a worked end-to-end example is in [`examples/walkthrough.sql`](examples/walkthrough.sql).
+
+## The two calls everything hangs on
+
+- **I don't store "the current provider" on the session.** The second you do that, a rematch overwrites it and you've lost who actually delivered. So *who delivers* gets its own table.
+- **I don't trust the portal, n8n and the Xero sync to each be careful on their own.** Three independent writers will race eventually, so I'd rather push the real guarantees down into Postgres than coordinate them in app code.
 
 ---
 
-## Part 1 — The data model
+## Schema
 
-### How I'm modelling it
+```mermaid
+erDiagram
+    clients {
+        uuid client_id PK
+        text full_name
+        text xero_contact_id
+    }
+    service_providers {
+        uuid sp_id PK
+        text full_name
+    }
+    engagements {
+        uuid engagement_id PK
+        uuid client_id FK
+        text rrule
+        int rate_cents
+    }
+    sessions {
+        uuid session_id PK
+        uuid engagement_id FK
+        text status
+        int version
+    }
+    session_assignments {
+        uuid assignment_id PK
+        uuid session_id FK
+        uuid sp_id FK
+        text status
+        bool is_active
+        uuid superseded_by FK
+    }
+    xero_invoices {
+        uuid xero_invoice_id PK
+        uuid client_id FK
+        date period_month
+        text xero_id
+    }
+    invoice_lines {
+        uuid invoice_line_id PK
+        uuid assignment_id FK
+        uuid xero_invoice_id FK
+        int amount_cents
+        text status
+    }
+    sync_outbox {
+        bigint outbox_id PK
+        uuid aggregate_id
+        text op
+        text idempotency_key
+        text status
+    }
 
-A session is just a slot in time and never changes. Who's on the hook to deliver it lives in a separate `session_assignments` table, one row per provider that's ever held that slot. A cancel-and-rematch doesn't touch a "provider" column anywhere; it closes the old assignment and opens a new one. That way the history isn't something I have to remember to log — it's just the rows sitting there.
+    clients             ||--o{ engagements         : "books"
+    clients             ||--o{ sessions            : "for"
+    engagements         ||--o{ sessions            : "expands into"
+    sessions            ||--o{ session_assignments : "one active"
+    service_providers   ||--o{ session_assignments : "delivers"
+    session_assignments ||--o| invoice_lines       : "delivered = one line"
+    clients             ||--o{ xero_invoices       : "billed monthly"
+    xero_invoices       ||--o{ invoice_lines       : "batches"
+    xero_invoices       ||--o{ sync_outbox         : "sync jobs"
+```
+
+### Tables at a glance
 
 | Table | What it's for | PK | Key FKs |
 |---|---|---|---|
 | `clients` | The people booking sessions | `client_id` | — |
 | `service_providers` | Who delivers the sessions | `sp_id` | — |
-| `engagements` | A recurring arrangement (the series) | `engagement_id` | `client_id` |
+| `engagements` | A recurring arrangement; carries the price | `engagement_id` | `client_id` |
 | `sessions` | A single scheduled slot, never edited | `session_id` | `engagement_id`, `client_id` |
-| `session_assignments` | Every provider that held a slot | `assignment_id` | `session_id`, `sp_id`, `superseded_by` |
-| `xero_invoices` | Groups lines into one Xero invoice | `xero_invoice_pk` | `client_id` |
-| `invoice_lines` | One per delivered slot, syncs to Xero | `invoice_line_id` | `assignment_id` (UQ), `xero_invoice_pk` |
+| `session_assignments` | Every provider that held a slot (one active) | `assignment_id` | `session_id`, `sp_id`, `superseded_by` |
+| `xero_invoices` | One invoice per client per month (batches lines) | `xero_invoice_id` | `client_id` |
+| `invoice_lines` | One issued line per delivered slot | `invoice_line_id` | `assignment_id`, `xero_invoice_id` |
+| `sync_outbox` | Queue of Xero sync jobs | `outbox_id` | `aggregate_id` → `xero_invoices` |
 
-### The tables
+Full runnable DDL: [`schema.sql`](schema.sql).
 
-Parties, the recurring engagement, and the session slot itself:
+---
+
+## Part 1 — The model & cancel-and-rematch
+
+A `session` is just a slot in time and never gets edited. Who's on the hook to deliver it lives in `session_assignments`, one row per provider that's ever held that slot. A cancel-and-rematch doesn't touch a "provider" field anywhere; it **closes** the old assignment and **opens** a new one. So the history isn't something I have to remember to log, it's just the rows sitting there.
+
+The price lives on the `engagement` and gets copied onto the line at delivery, so a later re-rate never rewrites old invoices:
 
 ```sql
-create table clients (
-  client_id   uuid primary key default gen_random_uuid(),
-  full_name   text not null,
-  email       text unique,
-  created_at  timestamptz not null default now()
-);
-
-create table service_providers (
-  sp_id           uuid primary key default gen_random_uuid(),
-  full_name       text not null,
-  status          text not null default 'active',
-  xero_contact_id text,                 -- their identity in Xero
-  created_at      timestamptz not null default now()
-);
-
-create table engagements (              -- the recurring arrangement (series)
+create table engagements (
   engagement_id uuid primary key default gen_random_uuid(),
   client_id     uuid not null references clients,
   service_type  text not null,
-  rrule         text,                   -- iCal RRULE for the recurrence
-  rate_cents    int  not null,          -- price per session, copied at delivery
+  rrule         text,                       -- iCal RRULE for the recurrence
+  rate_cents    int  not null,              -- price per session, copied at delivery
   currency      char(3) not null default 'AUD',
   status        text not null default 'active',
   created_at    timestamptz not null default now()
 );
 
-create table sessions (                 -- one slot in time, never edited
-  session_id      uuid primary key default gen_random_uuid(),
-  engagement_id   uuid not null references engagements,
-  client_id       uuid not null references clients,
-  sequence_no     int  not null,        -- nth session in the series
-  scheduled_start timestamptz not null,
-  scheduled_end   timestamptz not null,
-  status          text not null default 'scheduled',
-  version         int  not null default 0,   -- used for the locking in part 2
-  created_at      timestamptz not null default now(),
-  unique (engagement_id, sequence_no)
-);
-```
-
-The assignments table is where the history actually lives. The one thing I really care about is that only one assignment is live at a time, and I'd rather the database enforce that than hope the app does, so there's a partial unique index at the bottom:
-
-```sql
-create table session_assignments (      -- every provider that held the slot
-  assignment_id uuid primary key default gen_random_uuid(),
-  session_id    uuid not null references sessions,
-  sp_id         uuid not null references service_providers,
-  status        text not null default 'assigned',
-    -- assigned | delivered | no_show | cancelled | rematched
-  is_active     boolean not null default true,
-  assigned_at   timestamptz not null default now(),
-  delivered_at  timestamptz,
-  cancel_reason text,
-  superseded_by uuid references session_assignments,  -- old row -> replacement
-  version       int  not null default 0,
-  created_at    timestamptz not null default now()
+create table session_assignments (
+  assignment_id  uuid primary key default gen_random_uuid(),
+  session_id     uuid not null references sessions,
+  sp_id          uuid not null references service_providers,
+  status         text not null default 'assigned',
+                 -- assigned | delivered | no_show | cancelled | rematched
+  is_active      boolean not null default true,
+  delivered_at   timestamptz,
+  cancel_reason  text,
+  superseded_by  uuid references session_assignments,  -- old row -> replacement
+  version        int  not null default 0,
+  created_at     timestamptz not null default now()
 );
 
 -- only one live assignment per session, enforced by the DB
@@ -93,38 +135,19 @@ create unique index one_active_assignment_per_session
   on session_assignments (session_id) where is_active;
 ```
 
-Invoices hang off the delivered assignment, not the session — so I always bill the provider who actually showed up. Lines sit under a `xero_invoices` header so a client gets one invoice per period rather than one per session. The unique on `assignment_id` is doing real work; I'll come back to it in part 2:
+An assignment only moves in one direction:
 
-```sql
-create table xero_invoices (            -- groups lines into one Xero invoice
-  xero_invoice_pk uuid primary key default gen_random_uuid(),
-  client_id       uuid not null references clients,
-  period          text not null,        -- e.g. '2026-06'
-  xero_invoice_id text,                 -- null until created in Xero
-  status          text not null default 'draft',
-  created_at      timestamptz not null default now()
-);
-
-create table invoice_lines (            -- one per delivered assignment
-  invoice_line_id uuid primary key default gen_random_uuid(),
-  assignment_id   uuid not null unique references session_assignments,
-  client_id       uuid not null references clients,
-  sp_id           uuid not null references service_providers,
-  xero_invoice_pk uuid references xero_invoices,
-  amount_cents    int  not null,        -- copied from engagement at delivery
-  currency        char(3) not null default 'AUD',
-  sync_status     text not null default 'pending',  -- pending | synced | failed
-  xero_line_id    text,
-  synced_at       timestamptz,
-  created_at      timestamptz not null default now()
-);
+```mermaid
+stateDiagram-v2
+    [*] --> assigned
+    assigned --> delivered : provider delivers
+    assigned --> no_show   : provider no-shows
+    assigned --> cancelled : session cancelled
+    assigned --> rematched : swapped to a new provider
+    delivered --> [*]
 ```
 
-### Why this keeps the history
-
-A cancelled assignment never produces an invoice, only a delivered one does, so "who delivered what" is just `select * from session_assignments where status = 'delivered'`. When SP A gets dropped and SP B takes over, A's row doesn't go anywhere: it ends as `rematched` with `superseded_by` pointing at B's new row, so I can walk the whole chain for any slot. And because of the index there's physically no way to end up with two live providers on one session, even if some n8n flow does something silly.
-
-### Cancel-and-rematch, in one transaction
+The rematch is one transaction:
 
 ```sql
 begin;
@@ -136,107 +159,177 @@ begin;
    where session_id = $sid and is_active and status = 'assigned';
 
   insert into session_assignments (session_id, sp_id, status, is_active)
-  values ($sid, $new_sp, 'assigned', true);
+  values ($sid, $new_sp, 'assigned', true)
+  returning assignment_id;   -- set superseded_by on the closed row from this id
 commit;
 ```
 
-The `status = 'assigned'` check stops me rematching something that was already delivered, and the row lock plus that unique index mean two rematches firing at the same time can't both win. One of them just hits a unique violation and retries.
+The `status = 'assigned'` check stops me rematching something that was already delivered, and the row lock plus that partial unique index mean two rematches firing at once can't both win. One just hits a unique violation and retries. "Who delivered what" ends up being a one-liner (`where status = 'delivered'`), and the trail for a reassigned slot is right there as `old → new`.
+
+### Walkthrough: one session, start to finish
+
+Following client **Maria**, with providers **Alex** and **Bea**:
+
+1. **Maria signs up** for weekly coaching → `clients +1`, `engagements +1` (`rrule = weekly`, `rate_cents` set).
+2. **The recurrence is expanded into slots** → `sessions: #1, #2, #3 …`, each `scheduled` and never edited after.
+3. **Slot #1 → Alex** → `session_assignments +1` `{ sp: Alex, assigned, is_active: true }`.
+4. **Alex delivers #1** → his assignment → `delivered`; an `invoice_line` is created and rolled into Maria's June invoice (more in Part 3).
+5. **Slot #2: Alex is out, so we rematch to Bea** → Alex's row becomes `{ rematched, is_active: false, superseded_by → Bea }` (kept, not deleted); Bea gets a fresh `{ assigned, is_active: true }` row. The `sessions` row is untouched.
+6. **Bea delivers #2** → a second line on the *same* June invoice. Alex is never billed; he didn't deliver.
+7. **"Who delivered what for Maria?"** → `#1 = Alex`, `#2 = Bea`; the trail for #2 is `Alex → Bea`. Nothing overwritten.
+
+(That exact sequence is runnable in [`examples/walkthrough.sql`](examples/walkthrough.sql).)
 
 ---
 
-## Part 2 — Keeping three writers off each other's toes
+## Part 2 — Three writers, one session
 
-Three things write to the same session: the portal, the n8n flows, and whatever's pushing to Xero. I need two properties out of this — concurrent edits shouldn't clobber each other, and a retried automation shouldn't create duplicates or bill twice. I lean on the database for all of it rather than try to coordinate the writers.
+The portal, the n8n flows, and the Xero sync all write the same session. I need two properties: concurrent edits shouldn't clobber each other, and a retried automation shouldn't create duplicates or bill twice. I lean on the database for all of it.
 
-### 1. Unique constraints, so retries are basically free
-
-`invoice_lines.assignment_id` is unique, so a delivered session can only ever have one invoice line. If n8n runs the create step twice (and it will, eventually), the second one is a no-op:
+**1. Unique constraints, so retries are cheap.** Only one *issued* line can exist per delivered assignment (a partial unique index on `assignment_id where status = 'issued'`). If n8n's create step runs twice, the second one is a no-op:
 
 ```sql
-insert into invoice_lines (assignment_id, client_id, sp_id, amount_cents)
-values ($aid, $cid, $sp, $amt)
-on conflict (assignment_id) do nothing;   -- a retry just does nothing
+insert into invoice_lines (assignment_id, xero_invoice_id, client_id, sp_id, amount_cents)
+values (...)
+on conflict (assignment_id) where status = 'issued' do nothing;   -- a retry does nothing
 ```
 
 This is the main thing stopping a double-bill, and it doesn't rely on the automation being well written.
 
-### 2. Idempotency keys for the multi-step stuff
+**2. Idempotency keys for the multi-step stuff.** Each n8n run carries a key like `hash(session_id + 'deliver' + run_id)`, written into a `processed_events` table in the same transaction as the work. Replay the workflow and it collides on the key and bails. The constraint stops a duplicate *row*; the key stops a duplicate *run*.
 
-Each n8n run carries a key, something like `hash(session_id + 'deliver' + run_id)`, written into a `processed_events` table in the same transaction as the work it's doing. Replay the workflow and it collides on the key and bails out. The constraint above stops a duplicate row; the key stops a duplicate run from getting halfway through.
-
-### 3. A version column so edits don't get lost
-
-For the case where the portal and an n8n flow both edit the same session: every editable row has a `version`, and updates are conditional on it. Zero rows changed means someone got there first, so I re-read and decide again. No long-held locks, no silently lost write:
+**3. A version column so edits don't get lost.** Every editable row has a `version`, and updates are conditional on it. Zero rows changed means someone got there first, so I re-read and decide again. No long locks, no lost writes:
 
 ```sql
 update sessions set status = 'cancelled', version = version + 1
- where session_id = $sid and version = $expected;  -- 0 rows = someone beat me
+ where session_id = $sid and version = $expected;   -- 0 rows = someone beat me to it
 ```
 
-### 4. Read-committed is enough
+**4. One writer to Xero, via an outbox.** The portal and n8n never call Xero directly; that's all of Part 3. It's what stops three systems racing on the same external invoice.
 
-The Supabase default (READ COMMITTED) plus the explicit locks above covers all of this. The only place I'd reach for SERIALIZABLE is the rematch transaction, with a retry on a 40001 — it's rare, and it's the one spot where getting it wrong actually hurts.
+On isolation: `READ COMMITTED` (the Supabase default) plus the row lock above is enough. The only place I'd reach for `SERIALIZABLE` (retrying on a `40001`) is the rematch transaction, since that's the one spot where getting it wrong actually hurts.
 
 ---
 
-## Part 3 — Delivered session to Xero, without ever double-billing
+## Part 3 — Delivered sessions → Xero
 
-This is the part I'd be most careful about, because n8n will retry and money is the thing you can't get wrong. The rule I follow: nothing calls the Xero API inline. Delivering a session and creating the (pending) invoice line happen in one transaction; a separate worker drains the queue and talks to Xero. That avoids the dual-write trap where the DB commits but the Xero call times out and a retry bills again.
+Two things matter: a client's deliveries in a month should land on **one** invoice, not one per session; and the sync has to be safe to retry, because n8n will retry and money is the thing you can't get wrong. So delivery writes the billing rows locally and **queues** a sync job. A single worker is the only thing that talks to Xero, which avoids the dual-write trap where the DB commits but the Xero call times out and a retry bills again.
 
-A single worker — or a few — picks up pending lines with `for update skip locked`, so I can scale the workers out and none of them grab the same row:
+When a session is delivered, all in one transaction:
 
 ```sql
-update invoice_lines set sync_status = 'syncing'
- where invoice_line_id = (
-   select invoice_line_id from invoice_lines
-    where sync_status = 'pending'
+begin;
+  -- 1. mark the assignment delivered
+  update session_assignments
+     set status = 'delivered', delivered_at = now(), version = version + 1
+   where assignment_id = $aid and status = 'assigned';
+
+  -- 2. make sure this client has an invoice open for the current month
+  insert into xero_invoices (client_id, period_month)
+  values ($cid, date_trunc('month', now())::date)
+  on conflict (client_id, period_month) do nothing;
+
+  -- 3. one issued line per delivered assignment, rolled into that month's invoice
+  insert into invoice_lines (assignment_id, xero_invoice_id, client_id, sp_id, amount_cents)
+  select $aid, xi.xero_invoice_id, $cid, $sp, $amt
+    from xero_invoices xi
+   where xi.client_id = $cid and xi.period_month = date_trunc('month', now())::date
+  on conflict (assignment_id) where status = 'issued' do nothing;
+
+  -- 4. queue exactly one Xero job for the change
+  insert into sync_outbox (aggregate, aggregate_id, op, idempotency_key)
+  select 'xero_invoice', xi.xero_invoice_id,
+         case when xi.xero_id is null then 'create' else 'update' end,
+         'inv:' || xi.xero_invoice_id || ':' || $aid
+    from xero_invoices xi
+   where xi.client_id = $cid and xi.period_month = date_trunc('month', now())::date
+  on conflict (idempotency_key) do nothing;
+commit;
+```
+
+The worker drains the outbox, and several can run at once without stepping on each other:
+
+```sql
+update sync_outbox
+   set status = 'processing', attempts = attempts + 1
+ where outbox_id = (
+   select outbox_id from sync_outbox
+    where status = 'pending'
     order by created_at
-    for update skip locked      -- run a few workers, none grab the same row
+    for update skip locked
     limit 1)
 returning *;
 ```
 
-Before it POSTs anything it checks whether this line already has a Xero id. Null means create it and store the id back; not-null means this is a retry, so skip the create and just reconcile. So a double-bill has to get past **three** independent things: the unique constraint (only one line can exist per delivered assignment), the id check (don't re-create what's already there), and Xero's own idempotency key. And if Xero is down, the rows just sit `pending` until it's back — nothing's lost.
+Then it loads the `xero_invoices` header plus its `invoice_lines` and checks `xero_id`:
 
-Lines attach to a `xero_invoices` header so they bill as one invoice per client per period; when the period closes the worker pushes the draft and finalises it. A correction is a void on the line (which frees the unique slot) plus a fresh line, synced to Xero as an adjustment — never an in-place edit of something Xero already issued.
+- **null** → `POST` a new invoice to Xero, store the returned `xero_id`, mark `synced`.
+- **set** → it already exists (this is a retry, or another line landed) → `PUT`/update it. **Never POST twice.**
+
+So billing twice has to get past three guards: the partial unique index on the line, `unique(idempotency_key)` on the job, and the `xero_id` check before any create. When the month closes the worker finalises the draft into an issued invoice. And if Xero is down, jobs just sit `pending` and drain when it's back; delivery never blocks on an external API.
+
+**Corrections.** I never edit an invoice Xero has already issued. To fix a line I void it (`status = 'voided'`, which frees the partial-unique slot), insert a fresh `issued` line, and let the worker push it to Xero as an adjustment. The history of the original line stays intact.
 
 ---
 
-## Part 4 — Rolling it out with no downtime
+## Part 4 — Migrating with zero downtime
 
-I'd do this as an expand/contract migration — stand the new model up alongside the old one, move traffic across gradually, and only retire the old shape at the very end. Every step is reversible and nothing takes a blocking lock.
+I'd do this as **expand / contract** (parallel change), never a big-bang `ALTER` in a maintenance window. Every step is additive and independently reversible.
 
-**Expand.** Create the new tables and any new columns as nullable, build indexes with `CREATE INDEX CONCURRENTLY`, and add foreign keys as `NOT VALID` first, then `VALIDATE` in a separate step so they never take a full-table lock. I'd set a `lock_timeout` so a migration that would block just bails instead of queuing behind live traffic:
+**1. Expand, additive and online.** Create the new tables and add any new columns. `CREATE TABLE` and adding a nullable column (or one with a *constant* default on PG11+) are metadata-only and instant. Build indexes with `CREATE INDEX CONCURRENTLY` so I never take a write lock on a live table. Add foreign keys `NOT VALID` first, then `VALIDATE CONSTRAINT` as a separate step so the scan doesn't hold an exclusive lock. And set a short `lock_timeout` so a blocked DDL backs off instead of queueing and stalling every query behind it.
 
 ```sql
-alter table invoice_lines
-  add constraint fk_line_assignment
-  foreign key (assignment_id) references session_assignments
-  not valid;                         -- instant, no full-table scan
+create unique index concurrently one_active_assignment_per_session
+  on session_assignments (session_id) where is_active;
 
-alter table invoice_lines validate constraint fk_line_assignment;  -- non-blocking
+alter table invoice_lines
+  add constraint invoice_lines_assignment_fk
+  foreign key (assignment_id) references session_assignments not valid;
+alter table invoice_lines validate constraint invoice_lines_assignment_fk;
 ```
 
-**Dual-write.** Ship app code that writes to both the old structure and the new tables. Reads still come from the old one, so nothing user-facing changes yet.
+**2. Dual-write.** Behind a flag, the app writes both shapes. Every new delivery writes the old representation *and* a `session_assignments` row. From here forward the two stay in sync, so I'm only ever missing history, never live data.
 
-**Backfill.** Move the history across in small idempotent batches keyed on the source id (`on conflict do nothing`), so it's safe to stop and restart and never holds a long lock.
+**3. Backfill, batched and resumable.** Copy existing rows into the new tables in chunks, committing each batch with a tiny pause between them. Small transactions keep locks short and stop WAL/replication from blowing up; `on conflict do nothing` makes it safe to re-run.
 
-**Verify.** Shadow-read from the new model and diff it against the old in the background — and I'd be strict reconciling invoice totals, because that's money.
+```sql
+-- run in a loop until it affects 0 rows
+with batch as (
+  select s.session_id, s.sp_id
+  from sessions s
+  left join session_assignments a on a.session_id = s.session_id
+  where a.session_id is null
+  order by s.session_id
+  limit 2000
+)
+insert into session_assignments (session_id, sp_id, status, is_active)
+select session_id, sp_id, 'delivered', true from batch
+on conflict do nothing;
+```
 
-**Cut over.** Flip reads to the new model behind a feature flag, one slice of traffic at a time, with instant rollback if anything looks off.
+**4. Verify.** Still dual-writing, reconcile counts and a checksum of (session → delivering provider) old vs new, and I'd be strict reconciling invoice totals, because that's money. Only proceed when they match.
 
-**Contract.** Once it's served all reads cleanly for a bake-in period, stop dual-writing and drop the old columns and tables in a later release.
+**5. Cutover.** Flip the read flag so the app reads from the new tables, one slice of traffic at a time. Keep dual-writing for a bake-in period as a rollback path. If anything's off, flip back, nothing lost.
 
-On Supabase specifically: I'd keep every step as a versioned migration, and make sure RLS policies exist on the new tables before any read flips to them, since the portal reads through RLS.
+**6. Contract.** Once it's been happy in production for a while, stop writing the old columns and drop them (`DROP COLUMN` / `DROP TABLE` is metadata-only and instant), and add the final `NOT NULL` / constraints now that the new columns are fully populated.
+
+**On Supabase specifically:** I'd keep every step as a versioned migration, and make sure **RLS policies exist on the new tables before any read flips to them** — the portal reads through RLS, so a table without policies reads as empty. No maintenance window, every step reversible, and the only slow part (backfill) runs in the background.
 
 ---
 
-## A few assumptions
+## Assumptions
 
-The brief's a compressed version of the real thing, so to be explicit about what I assumed:
+The brief left a few things open, so to be explicit:
 
-- Price lives on the engagement and gets copied onto the invoice line at delivery time, so a later re-rate doesn't rewrite old invoices.
-- Once Xero has issued an invoice number it owns it. I store the id and never re-create.
-- One delivered session is one invoice line. Partial delivery or multi-currency would add columns to `invoice_lines` but wouldn't change the shape of the model.
+- Price lives on the `engagement` (`rate_cents`) and is **copied onto the invoice line at delivery time**, so a later re-rate doesn't rewrite old invoices.
+- Billing batches **per client per calendar month** into one Xero invoice. A different cadence is a change to the `xero_invoices` unique key, not the model.
+- Once Xero has issued an invoice it owns the number, so I store `xero_id` and never recreate; corrections go through as adjustments.
+- One delivered session is one issued invoice line. Partial delivery or multi-currency would add columns to `invoice_lines` but wouldn't change the shape.
 
-Happy to talk through any of it, or go deeper on the concurrency or migration side if that's the part you care most about.
+## Notes / likely questions
+
+- **Why not an audit/history table instead of `session_assignments`?** Because the invoice has to point at a *specific delivery*. Assignments make the delivery a real, queryable row, and the partial unique index gives the "one active provider" guarantee without any extra code.
+- **What enforces one active provider, app code?** No, the database: `create unique index … where is_active`.
+- **Why a `sync_outbox` instead of letting n8n call Xero?** One writer to Xero instead of three, idempotent, survives a Xero outage, and delivery doesn't block on an external API.
+- **How do you fix a wrong invoice?** Void the line (frees the unique slot), add a fresh one, and sync it to Xero as an adjustment — never an in-place edit of an issued invoice.
+- **Co-delivery (two providers on one session)?** Already supported: many assignments per session, so I'd just allow more than one `delivered`.
